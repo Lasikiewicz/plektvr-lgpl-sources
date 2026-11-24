@@ -1,0 +1,270 @@
+diff -ruN a/configure b/configure
+--- a/configure	2024-09-30 00:31:47.000000000 +0100
++++ b/configure	2026-11-24 19:57:18.025315000 +0000
+@@ -3325,6 +3325,8 @@
+ 
+ aac_mediacodec_decoder_deps="mediacodec"
+ aac_mediacodec_decoder_select="aac_adtstoasc_bsf aac_parser"
++ac3_mediacodec_decoder_deps="mediacodec"
++ac3_mediacodec_decoder_select="ac3_parser"
+ aac_mf_encoder_deps="mediafoundation"
+ ac3_mf_encoder_deps="mediafoundation"
+ amrnb_mediacodec_decoder_deps="mediacodec"
+@@ -3396,6 +3398,8 @@
+ mp3_mf_encoder_deps="mediafoundation"
+ mp3_mediacodec_decoder_deps="mediacodec"
+ mp3_mediacodec_decoder_select="mpegaudioheader"
++eac3_mediacodec_decoder_deps="mediacodec"
++eac3_mediacodec_decoder_select="ac3_parser"
+ mpeg1_cuvid_decoder_deps="cuvid"
+ mpeg1_v4l2m2m_decoder_deps="v4l2_m2m mpeg1_v4l2_m2m"
+ mpeg2_cuvid_decoder_deps="cuvid"
+diff -ruN a/libavcodec/Makefile b/libavcodec/Makefile
+--- a/libavcodec/Makefile	2024-09-30 00:31:47.000000000 +0100
++++ b/libavcodec/Makefile	2026-11-24 19:57:18.043312200 +0000
+@@ -200,6 +200,8 @@
+                                           psymodel.o kbdwin.o \
+                                           mpeg4audio_sample_rates.o
+ OBJS-$(CONFIG_AAC_MEDIACODEC_DECODER)  += mediacodecdec.o
++OBJS-$(CONFIG_AC3_MEDIACODEC_DECODER)  += mediacodecdec.o
++OBJS-$(CONFIG_EAC3_MEDIACODEC_DECODER) += mediacodecdec.o
+ OBJS-$(CONFIG_AAC_MF_ENCODER)          += mfenc.o mf_utils.o
+ OBJS-$(CONFIG_AASC_DECODER)            += aasc.o msrledec.o
+ OBJS-$(CONFIG_AC3_DECODER)             += ac3dec_float.o ac3dec_data.o ac3.o \
+diff -ruN a/libavcodec/allcodecs.c b/libavcodec/allcodecs.c
+--- a/libavcodec/allcodecs.c	2024-09-30 00:31:47.000000000 +0100
++++ b/libavcodec/allcodecs.c	2026-11-24 19:57:18.059739900 +0000
+@@ -823,6 +823,8 @@
+ /* external libraries, that shouldn't be used by default if one of the
+  * above is available */
+ extern const FFCodec ff_aac_mediacodec_decoder;
++extern const FFCodec ff_ac3_mediacodec_decoder;
++extern const FFCodec ff_eac3_mediacodec_decoder;
+ extern const FFCodec ff_aac_mf_encoder;
+ extern const FFCodec ff_ac3_mf_encoder;
+ extern const FFCodec ff_amrnb_mediacodec_decoder;
+diff -ruN a/libavcodec/mediacodec_wrapper.c b/libavcodec/mediacodec_wrapper.c
+--- a/libavcodec/mediacodec_wrapper.c	2024-09-30 00:31:48.000000000 +0100
++++ b/libavcodec/mediacodec_wrapper.c	2026-11-24 19:57:18.076805300 +0000
+@@ -535,7 +535,10 @@
+                 goto done;
+             }
+ 
+-            if (is_software_only) {
++            /* Platform audio decoders (for example the device's licensed
++             * Dolby and AAC decoders) are software-only, so only skip
++             * software-only codecs for video. */
++            if (is_software_only && strncmp(mime, "audio/", 6)) {
+                 goto done_with_info;
+             }
+         }
+diff -ruN a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
+--- a/libavcodec/mediacodecdec.c	2024-09-30 00:31:48.000000000 +0100
++++ b/libavcodec/mediacodecdec.c	2026-11-24 19:58:56.899138700 +0000
+@@ -26,6 +26,7 @@
+ #include <string.h>
+ 
+ #include "libavutil/avassert.h"
++#include "libavutil/channel_layout.h"
+ #include "libavutil/common.h"
+ #include "libavutil/mem.h"
+ #include "libavutil/opt.h"
+@@ -44,6 +45,7 @@
+ #include "jni.h"
+ #include "mediacodec_wrapper.h"
+ #include "mediacodecdec_common.h"
++#include "mpeg4audio.h"
+ 
+ typedef struct MediaCodecH264DecContext {
+ 
+@@ -293,6 +295,8 @@
+     CONFIG_VP9_MEDIACODEC_DECODER   || \
+     CONFIG_AV1_MEDIACODEC_DECODER   || \
+     CONFIG_AAC_MEDIACODEC_DECODER   || \
++    CONFIG_AC3_MEDIACODEC_DECODER   || \
++    CONFIG_EAC3_MEDIACODEC_DECODER  || \
+     CONFIG_AMRNB_MEDIACODEC_DECODER || \
+     CONFIG_AMRWB_MEDIACODEC_DECODER || \
+     CONFIG_MP3_MEDIACODEC_DECODER
+@@ -308,9 +312,11 @@
+ }
+ #endif
+ 
+-static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
++static int mediacodec_init_codec(AVCodecContext *avctx,
++                                 const uint8_t *extradata,
++                                 int extradata_size)
+ {
+-    int ret;
++    int ret = 0;
+     int sdk_int;
+ 
+     const char *codec_mime = NULL;
+@@ -318,9 +324,6 @@
+     FFAMediaFormat *format = NULL;
+     MediaCodecH264DecContext *s = avctx->priv_data;
+ 
+-    if (s->use_ndk_codec < 0)
+-        s->use_ndk_codec = !av_jni_get_java_vm(avctx);
+-
+     format = ff_AMediaFormat_new(s->use_ndk_codec);
+     if (!format) {
+         av_log(avctx, AV_LOG_ERROR, "Failed to create media format\n");
+@@ -396,6 +399,33 @@
+     case AV_CODEC_ID_AAC:
+         codec_mime = "audio/mp4a-latm";
+ 
++        if (extradata && extradata_size > 0) {
++            MPEG4AudioConfig mp4ac;
++            ff_AMediaFormat_setBuffer(format, "csd-0", (void *)extradata, extradata_size);
++            if (avpriv_mpeg4audio_get_config2(&mp4ac, extradata, extradata_size, 1, avctx) >= 0) {
++                if (avctx->sample_rate <= 0 && mp4ac.sample_rate > 0)
++                    avctx->sample_rate = mp4ac.sample_rate;
++                if (avctx->ch_layout.nb_channels <= 0 && mp4ac.channels > 0) {
++                    av_channel_layout_uninit(&avctx->ch_layout);
++                    av_channel_layout_default(&avctx->ch_layout, mp4ac.channels);
++                }
++            }
++        }
++        break;
++#endif
++#if CONFIG_AC3_MEDIACODEC_DECODER
++    case AV_CODEC_ID_AC3:
++        codec_mime = "audio/ac3";
++
++        ret = common_set_extradata(avctx, format);
++        if (ret < 0)
++            goto done;
++        break;
++#endif
++#if CONFIG_EAC3_MEDIACODEC_DECODER
++    case AV_CODEC_ID_EAC3:
++        codec_mime = "audio/eac3";
++
+         ret = common_set_extradata(avctx, format);
+         if (ret < 0)
+             goto done;
+@@ -435,11 +465,17 @@
+     ff_AMediaFormat_setString(format, "mime", codec_mime);
+ 
+     if (avctx->codec_type == AVMEDIA_TYPE_VIDEO) {
+-        ff_AMediaFormat_setInt32(format, "width", avctx->width);
+-        ff_AMediaFormat_setInt32(format, "height", avctx->height);
++        /* MPEG-TS (for example HLS) carries no container dimensions, and
++         * without a software decoder to probe them they stay 0, which
++         * MediaCodec rejects. Use a placeholder; the decoder reports the
++         * real size through its output format. */
++        ff_AMediaFormat_setInt32(format, "width", avctx->width > 0 ? avctx->width : 1920);
++        ff_AMediaFormat_setInt32(format, "height", avctx->height > 0 ? avctx->height : 1080);
+     } else {
+-        ff_AMediaFormat_setInt32(format, "channel-count", avctx->ch_layout.nb_channels);
+-        ff_AMediaFormat_setInt32(format, "sample-rate", avctx->sample_rate);
++        ff_AMediaFormat_setInt32(format, "channel-count",
++                                 avctx->ch_layout.nb_channels > 0 ? avctx->ch_layout.nb_channels : 2);
++        ff_AMediaFormat_setInt32(format, "sample-rate",
++                                 avctx->sample_rate > 0 ? avctx->sample_rate : 48000);
+     }
+ 
+     s->ctx = av_mallocz(sizeof(*s->ctx));
+@@ -487,12 +523,55 @@
+     return ret;
+ }
+ 
++static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
++{
++    MediaCodecH264DecContext *s = avctx->priv_data;
++
++    if (s->use_ndk_codec < 0)
++        s->use_ndk_codec = !av_jni_get_java_vm(avctx);
++
++#if CONFIG_AAC_MEDIACODEC_DECODER
++    /* ADTS AAC (for example MPEG-TS / HLS) arrives without extradata;
++     * aac_adtstoasc attaches the AudioSpecificConfig as packet side data
++     * on the first packet, so defer MediaCodec setup until then. */
++    if (avctx->codec_id == AV_CODEC_ID_AAC &&
++        (!avctx->extradata || !avctx->extradata_size)) {
++        return 0;
++    }
++#endif
++
++    return mediacodec_init_codec(avctx, avctx->extradata, avctx->extradata_size);
++}
++
+ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+ {
+     MediaCodecH264DecContext *s = avctx->priv_data;
+     int ret;
+     ssize_t index;
+ 
++    if (!s->ctx) {
++        size_t new_extradata_size = 0;
++        const uint8_t *new_extradata;
++
++        if (s->buffered_pkt.size <= 0) {
++            ret = ff_decode_get_packet(avctx, &s->buffered_pkt);
++            if (ret < 0)
++                return ret;
++        }
++
++        new_extradata = av_packet_get_side_data(&s->buffered_pkt,
++                                                AV_PKT_DATA_NEW_EXTRADATA,
++                                                &new_extradata_size);
++        if (!new_extradata || !new_extradata_size) {
++            new_extradata = avctx->extradata;
++            new_extradata_size = avctx->extradata_size;
++        }
++
++        ret = mediacodec_init_codec(avctx, new_extradata, new_extradata_size);
++        if (ret < 0)
++            return ret;
++    }
++
+     /* In delay_flush mode, wait until the user has released or rendered
+        all retained frames. */
+     if (s->delay_flush && ff_mediacodec_dec_is_flushing(avctx, s->ctx)) {
+@@ -576,7 +655,8 @@
+ 
+     av_packet_unref(&s->buffered_pkt);
+ 
+-    ff_mediacodec_dec_flush(avctx, s->ctx);
++    if (s->ctx)
++        ff_mediacodec_dec_flush(avctx, s->ctx);
+ }
+ 
+ static const AVCodecHWConfigInternal *const mediacodec_hw_configs[] = {
+@@ -686,7 +766,7 @@
+     FF_CODEC_RECEIVE_FRAME_CB(mediacodec_receive_frame),                                       \
+     .flush          = mediacodec_decode_flush,                                                 \
+     .close          = mediacodec_decode_close,                                                 \
+-    .p.capabilities = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_HARDWARE,                              \
++    .p.capabilities = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_HARDWARE | AV_CODEC_CAP_CHANNEL_CONF,  \
+     .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE,                                        \
+     .bsfs           = bsf,                                                                     \
+     .p.wrapper_name = "mediacodec",                                                            \
+@@ -696,6 +776,14 @@
+ DECLARE_MEDIACODEC_ADEC(aac, "AAC", AV_CODEC_ID_AAC, "aac_adtstoasc")
+ #endif
+ 
++#if CONFIG_AC3_MEDIACODEC_DECODER
++DECLARE_MEDIACODEC_ADEC(ac3, "AC-3", AV_CODEC_ID_AC3, NULL)
++#endif
++
++#if CONFIG_EAC3_MEDIACODEC_DECODER
++DECLARE_MEDIACODEC_ADEC(eac3, "E-AC-3", AV_CODEC_ID_EAC3, NULL)
++#endif
++
+ #if CONFIG_AMRNB_MEDIACODEC_DECODER
+ DECLARE_MEDIACODEC_ADEC(amrnb, "AMR-NB", AV_CODEC_ID_AMR_NB, NULL)
+ #endif
+diff -ruN a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
+--- a/libavcodec/mediacodecdec_common.c	2024-09-30 00:31:48.000000000 +0100
++++ b/libavcodec/mediacodecdec_common.c	2026-11-24 19:58:56.900639000 +0000
+@@ -421,7 +421,7 @@
+            "Frame: format=%d channels=%d sample_rate=%d nb_samples=%d",
+            avctx->sample_fmt, avctx->ch_layout.nb_channels, avctx->sample_rate, frame->nb_samples);
+ 
+-    memcpy(frame->data[0], data, info->size);
++    memcpy(frame->data[0], data + info->offset, info->size);
+ 
+     ret = 0;
+ done:
